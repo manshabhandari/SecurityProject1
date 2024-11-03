@@ -39,8 +39,11 @@ import (
 	//	"bytes" //un-comment for helpers like bytes.equal
 	"encoding/binary"
 	"errors"
+	"time"
 	//	"fmt" //un-comment if you want to do any debug printing.
 )
+
+const KeyRotationInterval = 24 * time.Hour
 
 // Labels for key derivation
 
@@ -78,6 +81,49 @@ type Session struct {
 	SendCounter       int
 	LastUpdate        int
 	ReceiveCounter    int
+	LastRatchetTime   time.Time
+}
+
+type SessionState struct {
+	RootChain        *SymmetricKey
+	SendChain        *SymmetricKey
+	ReceiveChain     *SymmetricKey
+	MyDHRatchet      *KeyPair
+	PartnerDHRatchet *PublicKey
+	SendCounter      int
+	ReceiveCounter   int
+}
+
+// Serialising and saving the session state
+func (c *Chatter) SaveSessionState(partnerIdentity *PublicKey) (*SessionState, error) {
+	session, exists := c.Sessions[*partnerIdentity]
+	if !exists {
+		return nil, errors.New("can't save state: no session with specified partner")
+	}
+	return &SessionState{
+		RootChain:        session.RootChain,
+		SendChain:        session.SendChain,
+		ReceiveChain:     session.ReceiveChain,
+		MyDHRatchet:      session.MyDHRatchet,
+		PartnerDHRatchet: session.PartnerDHRatchet,
+		SendCounter:      session.SendCounter,
+		ReceiveCounter:   session.ReceiveCounter,
+	}, nil
+}
+
+// Restoring a session from a saved state
+func (c *Chatter) RestoreSessionState(partnerIdentity *PublicKey, state *SessionState) error {
+	c.Sessions[*partnerIdentity] = &Session{
+		RootChain:         state.RootChain,
+		SendChain:         state.SendChain,
+		ReceiveChain:      state.ReceiveChain,
+		MyDHRatchet:       state.MyDHRatchet,
+		PartnerDHRatchet:  state.PartnerDHRatchet,
+		SendCounter:       state.SendCounter,
+		ReceiveCounter:    state.ReceiveCounter,
+		CachedReceiveKeys: make(map[int]*SymmetricKey),
+	}
+	return nil
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -128,15 +174,43 @@ func NewChatter() *Chatter {
 
 // EndSession erases all data for a session with the designated partner.
 // All outstanding key material should be zeroized and the session erased.
-func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
+// func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 
-	if _, exists := c.Sessions[*partnerIdentity]; !exists {
-		return errors.New("don't have that session open to tear down")
+// 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
+// 		return errors.New("don't have that session open to tear down")
+// 	}
+
+// 	delete(c.Sessions, *partnerIdentity)
+
+// 	// TODO: your code here to zeroize remaining state
+
+//		return nil
+//	}
+func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
+	session, exists := c.Sessions[*partnerIdentity]
+	if !exists {
+		return errors.New("can't end session: no open session with specified partner")
 	}
 
-	delete(c.Sessions, *partnerIdentity)
+	// Zeroize all keys in the session
+	if session.RootChain != nil {
+		session.RootChain.Zeroize()
+	}
+	if session.SendChain != nil {
+		session.SendChain.Zeroize()
+	}
+	if session.ReceiveChain != nil {
+		session.ReceiveChain.Zeroize()
+	}
 
-	// TODO: your code here to zeroize remaining state
+	// Clear cached receive keys for out-of-order message handling
+	for _, key := range session.CachedReceiveKeys {
+		key.Zeroize()
+	}
+	session.CachedReceiveKeys = nil
+
+	// Remove the session from the active sessions map
+	delete(c.Sessions, *partnerIdentity)
 
 	return nil
 }
@@ -261,26 +335,24 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 		return nil, errors.New("can't send message to partner with no open session")
 	}
 
-	// Perform DH ratchet if necessary (e.g., every 100 messages)
-	if session.SendCounter%100 == 0 {
+	// Perform key rotation if 100 messages sent or if time interval has passed
+	if session.SendCounter%100 == 0 || time.Since(session.LastRatchetTime) >= KeyRotationInterval {
 		newDHRatchet := GenerateKeyPair()
 		session.MyDHRatchet = newDHRatchet
 
-		// Derive a new root key and update send/receive chains
 		newRootKey := CombineKeys(
 			DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey),
 		)
 		session.RootChain = newRootKey
 		session.SendChain = newRootKey.DeriveKey(CHAIN_LABEL)
 		session.ReceiveChain = newRootKey.DeriveKey(CHAIN_LABEL)
+		session.LastRatchetTime = time.Now() // Update the last ratchet time
 	}
 
-	// Derive the message key from the send chain
 	messageKey := session.SendChain.DeriveKey(KEY_LABEL)
 	iv := NewIV()
 	ciphertext := messageKey.AuthenticatedEncrypt(plaintext, session.MyDHRatchet.Fingerprint(), iv)
 
-	// Prepare the message struct
 	message := &Message{
 		Sender:        &c.Identity.PublicKey,
 		Receiver:      partnerIdentity,
@@ -297,6 +369,7 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 	return message, nil
 }
 
+//PART 2
 // ReceiveMessage is used to receive the given message and return the correct
 // plaintext. This method is where most of the key derivation, ratcheting
 // and out-of-order message handling logic happens.
@@ -342,13 +415,57 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 //     return plaintext, nil
 // }
 
+//PART 3
+// func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
+// 	session, exists := c.Sessions[*message.Sender]
+// 	if !exists {
+// 		return "", errors.New("can't receive message from partner with no open session")
+// 	}
+
+// 	// Check if there's a new DH key from the sender
+// 	if message.NextDHRatchet != nil && message.NextDHRatchet != session.PartnerDHRatchet {
+// 		session.PartnerDHRatchet = message.NextDHRatchet.Duplicate()
+// 		newRootKey := CombineKeys(
+// 			DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey),
+// 		)
+// 		session.RootChain = newRootKey
+// 		session.SendChain = newRootKey.DeriveKey(CHAIN_LABEL)
+// 		session.ReceiveChain = newRootKey.DeriveKey(CHAIN_LABEL)
+// 	}
+
+// 	// Use a cached key if available
+// 	if cachedKey, ok := session.CachedReceiveKeys[message.Counter]; ok {
+// 		plaintext, err := cachedKey.AuthenticatedDecrypt(message.Ciphertext, message.Sender.Fingerprint(), message.IV)
+// 		if err == nil {
+// 			delete(session.CachedReceiveKeys, message.Counter)
+// 			return plaintext, nil
+// 		}
+// 	}
+
+// 	// Derive the message key from the receive chain
+// 	messageKey := session.ReceiveChain.DeriveKey(KEY_LABEL)
+// 	plaintext, err := messageKey.AuthenticatedDecrypt(message.Ciphertext, message.Sender.Fingerprint(), message.IV)
+// 	if err != nil {
+// 		return "", err
+// 	}
+
+// 	// Cache the derived key for out-of-order handling
+// 	session.CachedReceiveKeys[message.Counter] = messageKey
+
+// 	session.ReceiveCounter++
+// 	session.ReceiveChain = session.ReceiveChain.DeriveKey(CHAIN_LABEL)
+
+// 	return plaintext, nil
+// }
+
+// PART 4
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	session, exists := c.Sessions[*message.Sender]
 	if !exists {
-		return "", errors.New("can't receive message from partner with no open session")
+		return "", errors.New("can't receive message: no open session with sender")
 	}
 
-	// Check if there's a new DH key from the sender
+	// Check for a new DH key and update if necessary
 	if message.NextDHRatchet != nil && message.NextDHRatchet != session.PartnerDHRatchet {
 		session.PartnerDHRatchet = message.NextDHRatchet.Duplicate()
 		newRootKey := CombineKeys(
@@ -366,13 +483,14 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 			delete(session.CachedReceiveKeys, message.Counter)
 			return plaintext, nil
 		}
+		return "", errors.New("decryption failed for cached key: possible tampering")
 	}
 
 	// Derive the message key from the receive chain
 	messageKey := session.ReceiveChain.DeriveKey(KEY_LABEL)
 	plaintext, err := messageKey.AuthenticatedDecrypt(message.Ciphertext, message.Sender.Fingerprint(), message.IV)
 	if err != nil {
-		return "", err
+		return "", errors.New("decryption failed: possible tampering")
 	}
 
 	// Cache the derived key for out-of-order handling
