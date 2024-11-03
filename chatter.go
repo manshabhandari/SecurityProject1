@@ -131,7 +131,7 @@ func NewChatter() *Chatter {
 func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
-		return errors.New("Don't have that session open to tear down")
+		return errors.New("don't have that session open to tear down")
 	}
 
 	delete(c.Sessions, *partnerIdentity)
@@ -146,7 +146,7 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; exists {
-		return nil, errors.New("Already have session open")
+		return nil, errors.New("already have session open")
 	}
 
 	ephemeralKeyPair := GenerateKeyPair()
@@ -162,7 +162,7 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 
 	// TODO: your code here
 
-	return nil, errors.New("Not implemented")
+	return nil, errors.New("not implemented")
 }
 
 // ReturnHandshake prepares the second message sent in a handshake, containing
@@ -171,7 +171,7 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 	partnerEphemeral *PublicKey) (*PublicKey, *SymmetricKey, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; exists {
-		return nil, nil, errors.New("Already have session open")
+		return nil, nil, errors.New("already have session open")
 	}
 
 	//Generating Bob's ephemeral key pair for this session
@@ -205,7 +205,7 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 	partnerEphemeral *PublicKey) (*SymmetricKey, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
-		return nil, errors.New("Can't finalize session, not yet open")
+		return nil, errors.New("can't finalize session, not yet open")
 	}
 
 	session := c.Sessions[*partnerIdentity]
@@ -231,18 +231,29 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 	plaintext string) (*Message, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
-		return nil, errors.New("Can't send message to partner with no open session")
+		return nil, errors.New("can't send message to partner with no open session")
 	}
+
+	session := c.Sessions[*partnerIdentity]
+	messageKey := session.SendChain.DeriveKey(KEY_LABEL)
+	iv := NewIV()
+	ciphertext := messageKey.AuthenticatedEncrypt(plaintext, session.MyDHRatchet.Fingerprint(), iv)
 
 	message := &Message{
-		Sender:   &c.Identity.PublicKey,
-		Receiver: partnerIdentity,
-		// TODO: your code here
+		Sender:        &c.Identity.PublicKey,
+		Receiver:      partnerIdentity,
+		NextDHRatchet: &session.MyDHRatchet.PublicKey,
+		Counter:       session.SendCounter,
+		LastUpdate:    session.LastUpdate,
+		Ciphertext:    ciphertext,
+		IV:            iv,
 	}
+	session.SendCounter++
 
-	// TODO: your code here
+	//Ratcheting the send chain key by deriving the next send chain key
+	session.SendChain = session.SendChain.DeriveKey(CHAIN_LABEL)
 
-	return message, errors.New("Not implemented")
+	return message, errors.New("not implemented")
 }
 
 // ReceiveMessage is used to receive the given message and return the correct
@@ -251,10 +262,20 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
 	if _, exists := c.Sessions[*message.Sender]; !exists {
-		return "", errors.New("Can't receive message from partner with no open session")
+		return "", errors.New("can't receive message from partner with no open session")
 	}
 
-	// TODO: your code here
+	session := c.Sessions[*message.Sender]
+	messageKey := session.ReceiveChain.DeriveKey(KEY_LABEL)
+	plaintext, err := messageKey.AuthenticatedDecrypt(message.Ciphertext, message.NextDHRatchet.Fingerprint(), message.IV)
+	if err != nil {
+		return "", err
+	}
 
-	return "", errors.New("Not implemented")
+	session.ReceiveCounter++
+
+	//Ratcheting the receive chain key by deriving the next receive chain key
+	session.ReceiveChain = session.ReceiveChain.DeriveKey(CHAIN_LABEL)
+
+	return plaintext, nil
 }
