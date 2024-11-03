@@ -149,9 +149,15 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 		return nil, errors.New("Already have session open")
 	}
 
+	ephemeralKeyPair := GenerateKeyPair()
+
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
-		// TODO: your code here
+		MyDHRatchet:       ephemeralKeyPair, //Storing Alice's ephemeral key
+		PartnerDHRatchet:  partnerIdentity,  //Storing Bob's identity key (used in later DH exchanges)
+		SendCounter:       0,                //Initialising the message counter for outgoing messages
+		ReceiveCounter:    0,                //Initialising the message counter for incoming messages
+		// Deriving RootChain, SendChain, and ReceiveChain later
 	}
 
 	// TODO: your code here
@@ -168,14 +174,29 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 		return nil, nil, errors.New("Already have session open")
 	}
 
+	//Generating Bob's ephemeral key pair for this session
+	ephemeralKeyPair := GenerateKeyPair()
+
+	//Calculating the initial root key (kroot1) using Alice's identity and ephemeral keys
+	kroot1 := CombineKeys(
+		DHCombine(partnerIdentity, &ephemeralKeyPair.PrivateKey),  // gA·b
+		DHCombine(partnerEphemeral, &c.Identity.PrivateKey),       // ga·B
+		DHCombine(partnerEphemeral, &ephemeralKeyPair.PrivateKey), // ga·b
+	)
+
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
-		// TODO: your code here
+		MyDHRatchet:       ephemeralKeyPair, //Storing Bob’s ephemeral key
+		PartnerDHRatchet:  partnerEphemeral, //Storing Alice’s ephemeral key
+		RootChain:         kroot1,           //Storing the derived root key
+		SendCounter:       0,                //Initialising counters for messages
+		ReceiveCounter:    0,
 	}
 
-	// TODO: your code here
+	//Deriving an authentication key from kroot1 for Alice to verify
+	authKey := kroot1.DeriveKey(HANDSHAKE_CHECK_LABEL)
 
-	return nil, nil, errors.New("Not implemented")
+	return &ephemeralKeyPair.PublicKey, authKey, nil
 }
 
 // FinalizeHandshake lets the initiator receive the responder's ephemeral key
@@ -187,9 +208,21 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 		return nil, errors.New("Can't finalize session, not yet open")
 	}
 
-	// TODO: your code here
+	session := c.Sessions[*partnerIdentity]
 
-	return nil, errors.New("Not implemented")
+	//Calculating the initial root key (kroot1) using Bob's keys
+	kroot1 := CombineKeys(
+		DHCombine(partnerIdentity, &session.MyDHRatchet.PrivateKey),  // gA·b
+		DHCombine(partnerEphemeral, &c.Identity.PrivateKey),          // ga·B
+		DHCombine(partnerEphemeral, &session.MyDHRatchet.PrivateKey), // ga·b
+	)
+
+	//Storing the root key in the session
+	session.RootChain = kroot1
+
+	// Derive and return the authentication key for verification
+	authKey := kroot1.DeriveKey(HANDSHAKE_CHECK_LABEL)
+	return authKey, nil
 }
 
 // SendMessage is used to send the given plaintext string as a message.
