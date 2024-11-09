@@ -329,40 +329,50 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 
 //		return message, errors.New("not implemented")
 //	}
+//
+// Part 5 & 6
 func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Message, error) {
 	session, exists := c.Sessions[*partnerIdentity]
 	if !exists {
-		return nil, errors.New("can't send message to partner with no open session")
+		return nil, errors.New("Can't send message to partner with no open session")
 	}
 
-	// Perform key rotation if 100 messages sent or if time interval has passed
-	if session.SendCounter%100 == 0 || time.Since(session.LastRatchetTime) >= KeyRotationInterval {
+	// Perform a DH ratchet if message count threshold is reached
+	if session.SendCounter%100 == 0 { // Arbitrary threshold, e.g., every 100 messages
 		newDHRatchet := GenerateKeyPair()
 		session.MyDHRatchet = newDHRatchet
 
-		newRootKey := CombineKeys(
-			DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey),
-		)
-		session.RootChain = newRootKey
-		session.SendChain = newRootKey.DeriveKey(CHAIN_LABEL)
-		session.ReceiveChain = newRootKey.DeriveKey(CHAIN_LABEL)
-		session.LastRatchetTime = time.Now() // Update the last ratchet time
+		// Compute new root key from DH exchange
+		sharedKey := DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey)
+		session.RootChain = CombineKeys(session.RootChain.DeriveKey(ROOT_LABEL), sharedKey)
+
+		// Update Send and Receive Chains
+		session.SendChain = session.RootChain.DeriveKey(CHAIN_LABEL)
+		session.ReceiveChain = session.RootChain.DeriveKey(CHAIN_LABEL)
 	}
 
+	// Ratchet the send chain key and derive the message key
 	messageKey := session.SendChain.DeriveKey(KEY_LABEL)
-	iv := NewIV()
-	ciphertext := messageKey.AuthenticatedEncrypt(plaintext, session.MyDHRatchet.Fingerprint(), iv)
+	iv := NewIV() // Generate a random IV for each message
 
+	// Create a Message instance and prepare additional data for AEAD
 	message := &Message{
 		Sender:        &c.Identity.PublicKey,
 		Receiver:      partnerIdentity,
 		NextDHRatchet: &session.MyDHRatchet.PublicKey,
 		Counter:       session.SendCounter,
 		LastUpdate:    session.LastUpdate,
-		Ciphertext:    ciphertext,
-		IV:            iv,
 	}
+	additionalData := message.EncodeAdditionalData()
 
+	// Encrypt the message
+	ciphertext := messageKey.AuthenticatedEncrypt(plaintext, additionalData, iv)
+
+	// Complete the message struct with ciphertext and IV
+	message.Ciphertext = ciphertext
+	message.IV = iv
+
+	// Update session state: increment counter and ratchet the send chain
 	session.SendCounter++
 	session.SendChain = session.SendChain.DeriveKey(CHAIN_LABEL)
 
@@ -462,40 +472,40 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	session, exists := c.Sessions[*message.Sender]
 	if !exists {
-		return "", errors.New("can't receive message: no open session with sender")
+		return "", errors.New("Can't receive message from partner with no open session")
 	}
 
-	// Check for a new DH key and update if necessary
+	// Check for new DH ratchet key and update if it exists
 	if message.NextDHRatchet != nil && message.NextDHRatchet != session.PartnerDHRatchet {
+		oldRootChain := session.RootChain
+
+		// Update DH ratchet and compute new root key
 		session.PartnerDHRatchet = message.NextDHRatchet.Duplicate()
-		newRootKey := CombineKeys(
-			DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey),
-		)
-		session.RootChain = newRootKey
-		session.SendChain = newRootKey.DeriveKey(CHAIN_LABEL)
-		session.ReceiveChain = newRootKey.DeriveKey(CHAIN_LABEL)
+		sharedKey := DHCombine(session.PartnerDHRatchet, &session.MyDHRatchet.PrivateKey)
+		session.RootChain = CombineKeys(session.RootChain.DeriveKey(ROOT_LABEL), sharedKey)
+
+		// Update Send and Receive Chains
+		session.ReceiveChain = session.RootChain.DeriveKey(CHAIN_LABEL)
+		session.SendChain = session.RootChain.DeriveKey(CHAIN_LABEL)
+
+		defer func() {
+			if err := recover(); err != nil {
+				session.RootChain = oldRootChain // Restore root chain on failure
+			}
+		}()
 	}
 
-	// Use a cached key if available
-	if cachedKey, ok := session.CachedReceiveKeys[message.Counter]; ok {
-		plaintext, err := cachedKey.AuthenticatedDecrypt(message.Ciphertext, message.Sender.Fingerprint(), message.IV)
-		if err == nil {
-			delete(session.CachedReceiveKeys, message.Counter)
-			return plaintext, nil
-		}
-		return "", errors.New("decryption failed for cached key: possible tampering")
-	}
+	// Prepare additional data for AEAD
+	additionalData := message.EncodeAdditionalData()
 
 	// Derive the message key from the receive chain
 	messageKey := session.ReceiveChain.DeriveKey(KEY_LABEL)
-	plaintext, err := messageKey.AuthenticatedDecrypt(message.Ciphertext, message.Sender.Fingerprint(), message.IV)
+	plaintext, err := messageKey.AuthenticatedDecrypt(message.Ciphertext, additionalData, message.IV)
 	if err != nil {
 		return "", errors.New("decryption failed: possible tampering")
 	}
 
-	// Cache the derived key for out-of-order handling
-	session.CachedReceiveKeys[message.Counter] = messageKey
-
+	// Update session state only if decryption was successful
 	session.ReceiveCounter++
 	session.ReceiveChain = session.ReceiveChain.DeriveKey(CHAIN_LABEL)
 
