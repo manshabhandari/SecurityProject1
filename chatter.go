@@ -1,3 +1,5 @@
+// Worked on by: Mansha Bhandari (mkb9601) and Shreya Jakhar Choudhary (sc8941)
+
 // Implementation of a forward-secure, end-to-end encrypted messaging client
 // supporting key compromise recovery and out-of-order message delivery.
 // Directly inspired by Signal/Double-ratchet protocol but missing a few
