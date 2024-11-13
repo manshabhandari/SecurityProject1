@@ -7,3 +7,8 @@ Initially created by Joseph Bonneau, 2019. Get in touch if you would like to use
 
 ### Security warning
 This code is meant for educational purposes and may contain vulnerabilities or other bugs. Please do not use it for security-critical applications.
+
+## Partner
+Worked on this project:
+Mansha Bhandari mkb9601
+Shreya Jakhar Choudhary sc8941
